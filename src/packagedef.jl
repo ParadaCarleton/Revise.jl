@@ -979,8 +979,39 @@ end
         end
         return nothing
     end
+
+    # Whether a global that `rex` assigns in `mod` holds, at `world`, a value of a type
+    # `revised` names (or such a type itself): a `const` whose text is unchanged still
+    # holds an instance of the struct's pre-revision definition, so it must be re-evaluated.
+    function binds_revised_value(mod::Module, rex::RelocatableExpr, revised::IdSet{Core.TypeName}, world::UInt)
+        for name in add_assigned_names!(Set{Symbol}(), rex.ex)
+            Base.invoke_in_world(world, isdefinedglobal, mod, name) || continue
+            value = Base.invoke_in_world(world, getglobal, mod, name)
+            if value isa Type
+                mentions_typename(value, revised) && return true
+            elseif mentions_typename(typeof(value), revised)
+                return true
+            end
+        end
+        return false
+    end
+
+    # Whether `T`, its parameters or the members of a `Union` in it name a type in `revised`.
+    function mentions_typename(@nospecialize(T), revised::IdSet{Core.TypeName})
+        T = Base.unwrap_unionall(T)
+        if T isa Union
+            return mentions_typename(T.a, revised) || mentions_typename(T.b, revised)
+        end
+        T isa DataType || return false
+        T.name in revised && return true
+        for parameter in T.parameters
+            parameter isa Type && mentions_typename(parameter, revised) && return true
+        end
+        return false
+    end
 else
     retract_removed_bindings!(::Retraction, ::UInt, ::Vector{Retraction} = Retraction[]) = nothing
+    binds_revised_value(::Module, ::RelocatableExpr, ::IdSet{Core.TypeName}, ::UInt) = false
 end
 
 # Retract now, or append to `retractions` when the caller runs retractions only after
@@ -1805,7 +1836,8 @@ struct ReevalInfo
     ) = new(reeval, mod, exs_infos, rex, pkgdata, file)
 end
 
-function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reeval_list::IdSet{Union{Method,Type}}, world::UInt, worker_ps::AbstractVector)
+function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reeval_list::IdSet{Union{Method,Type}},
+                            handled_types::IdSet{Type}, world::UInt, worker_ps::AbstractVector)
     reeval_infos = ReevalInfo[]
     # Names of the types in `reeval_list`, all of which are bound at `world`. A `TypeInfo`
     # outside this set cannot match; skipping it avoids reading, at `world`, a binding
@@ -1816,6 +1848,9 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
         dt = Base.unwrap_unionall(reeval)
         dt isa DataType && push!(reeval_typenames, (dt.name.module, dt.name.name))
     end
+    # Every type this revision redefines: `reeval_list` holds only the edited types' dependents.
+    revised_typenames = IdSet{Core.TypeName}(Base.unwrap_unionall(T).name for T in handled_types)
+    rebinds = Tuple{Module,ExprsInfos,RelocatableExpr,PkgData,String}[]
 
     # N.B. This traverse could become expensive when Revise tracked code becomes large
     # We could optimize this part by preparing a `CodeTracking.ex_info` cache that incorporates
@@ -1825,7 +1860,14 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
     for (_, pkgdata) in pkgdatas
         for (file, fileinfo) in zip(srcfiles(pkgdata), pkgdata.fileinfos)
             for (mod, exs_infos) in fileinfo.mod_exs_infos
+                mode = revise_mode(mod, default_revise_mode(pkgdata))
+                assigns = !isempty(revised_typenames) && (mode === :eval || mode === :evalassign)
                 for (rex, exinfos) in exs_infos
+                    # A global whose statement is unchanged (e.g. `const DEFAULT = Point()`) still
+                    # holds a value of the pre-revision type: re-evaluate its statement too.
+                    if assigns && binds_revised_value(mod, rex, revised_typenames, world)
+                        push!(rebinds, (mod, exs_infos, rex, pkgdata, file))
+                    end
                     exinfos === nothing && continue
                     for exinfo in exinfos
                         if exinfo isa SigInfo
@@ -1909,6 +1951,26 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
                 delete!(exs_infos, rex)
                 bt = catch_backtrace()
                 log_caught(err, bt, "ReevalMethodFailed"; deltainfo=(reeval,mod,rex))
+                push!(revision_errors, (pkgdata, file))
+                queue_errors[(pkgdata, file)] = (err, bt)
+                push!(failures, (err, bt))
+            end
+        end
+    end
+    # Globals go last: their right-hand sides may call the constructors re-evaluated above.
+    for (mod, exs_infos, rex, pkgdata, file) in rebinds
+        (mod, rex) in evaluated_rexes && continue
+        push!(evaluated_rexes, (mod, rex))
+        with_logger(_debug_logger) do
+            @debug "ReevalBinding" _group="Action" time=time() deltainfo=(mod, rex)
+            try
+                newexinfos, _, thunk = eval_with_signatures(mod, rex.ex; mode=:eval)
+                exs_infos[rex] = newexinfos
+                replay_on_workers(mod, isexpr(thunk, :thunk) ? thunk : rex.ex)
+            catch err
+                delete!(exs_infos, rex)
+                bt = catch_backtrace()
+                log_caught(err, bt, "ReevalBindingFailed"; deltainfo=(mod, rex))
                 push!(revision_errors, (pkgdata, file))
                 queue_errors[(pkgdata, file)] = (err, bt)
                 push!(failures, (err, bt))
@@ -2619,8 +2681,10 @@ function _revise(; throw::Bool=false)
                 handle_type_deletion!(typeinfo, reeval_list, handled_types, world)
             end
         end
-        # `reeval_list` also includes surviving duplicate definitions (issue #1105).
-        isempty(reeval_list) || redefine_bindings!(revision_errors, reeval_list, world, worker_ps)
+        # `reeval_list` also includes surviving duplicate definitions (issue #1105). A redefined
+        # type with no dependents still needs the globals holding its values rebound.
+        isempty(reeval_list) && isempty(handled_types) ||
+            redefine_bindings!(revision_errors, reeval_list, handled_types, world, worker_ps)
 
         # Error handling
         if interrupt

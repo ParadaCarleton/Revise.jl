@@ -4554,6 +4554,45 @@ end
         end
     end
 
+    if Revise.__bpart__[] && do_test("struct revision (unchanged const)")
+        @testset "struct revision (unchanged const)" begin
+            testdir = newtestdir()
+            try
+                # A const whose text does not change but whose value is an instance of a
+                # revised struct must be re-evaluated, else it keeps the old type.
+                dn = joinpath(testdir, "StructUnchangedConst", "src")
+                mkpath(dn)
+                fn = joinpath(dn, "StructUnchangedConst.jl")
+                pkg_code_v1 = """
+                    module StructUnchangedConst
+                        Base.@kwdef struct Settings; a::Int = 1; end
+                        const DEFAULT = Settings()
+                        const DEFAULTS = (DEFAULT,)
+                    end
+                """
+                write(fn, pkg_code_v1)
+                sleep(mtimedelay)
+                @eval using StructUnchangedConst
+                sleep(mtimedelay)
+                @test StructUnchangedConst.DEFAULT.a == 1
+                # Revision 2: add a field; the const definitions are unchanged
+                pkg_code_v2 = replace(pkg_code_v1,
+                    "Base.@kwdef struct Settings; a::Int = 1; end" =>
+                    "Base.@kwdef struct Settings; a::Int = 1; b::Int = 2; end")
+                write(fn, pkg_code_v2)
+                @yry()
+                default = @invokelatest(getglobal(StructUnchangedConst, :DEFAULT))
+                settings = @invokelatest(getglobal(StructUnchangedConst, :Settings))
+                @test default isa settings
+                @test default.b == 2
+                @test @invokelatest(getglobal(StructUnchangedConst, :DEFAULTS)) isa Tuple{settings}
+            finally
+                rm_precompile("StructUnchangedConst")
+                pop!(LOAD_PATH)
+            end
+        end
+    end
+
     if Revise.__bpart__[] && do_test("struct revision (dependency)")   # can we revise types and constants?
         @testset "struct revision (dependency)" begin
             testdir = newtestdir()
