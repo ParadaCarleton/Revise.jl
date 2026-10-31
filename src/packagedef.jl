@@ -3256,7 +3256,6 @@ is what keeps closures serialized across workers (such as `@distributed` bodies)
 in sync after a revision, including for workers added later (issue #637).
 """
 function init_worker(p::AbstractWorker)
-    @invokelatest remotecall_impl(Core.eval, p, Main, :(import Serialization))  # `import` is only allowed at top level
     @invokelatest remotecall_impl(Core.eval, p, Main, quote
         function whichtt(mt::Union{Nothing, Core.MethodTable}, @nospecialize sig)
             ret = Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter())
@@ -3271,7 +3270,7 @@ function init_worker(p::AbstractWorker)
             isa(m, Method) && Base.delete_method(m)
         end
         function delete_method_by_sig(mt::Union{Nothing, Core.MethodTable}, sigbytes::AbstractVector{UInt8}, world::Integer)
-            sig = Base.invoke_in_world(UInt(world), Serialization.deserialize, IOBuffer(sigbytes))
+            sig = Base.invoke_in_world(UInt(world), Base.loaded_modules[Base.PkgId(Base.UUID("9e88b42a-f829-5b0c-bbe9-9e923198166b"), "Serialization")].deserialize, IOBuffer(sigbytes))
             m = whichtt(mt, sig)
             m === nothing && error("no method with signature ", sig, " to delete on worker ", Distributed.myid(), "; methods matching: ", Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter()))
             Base.delete_method(m)
