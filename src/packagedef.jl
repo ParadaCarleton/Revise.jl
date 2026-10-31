@@ -79,7 +79,7 @@ the worker out of sync with the master, so warn, and rethrow when `rethrow_error
 """
 function apply_worker_action(p, mod::Module, expr)
     try
-        @invokelatest remotecall_impl(Core.eval, p, mod, expr)
+        @invokelatest fetch(remotecall_impl(Core.eval, p, mod, expr))  # fetch rethrows the worker's error
     catch err
         bt = catch_backtrace()
         @warn "Revise could not apply an edit on worker $p; it may keep stale code" mod expr=first(split(string(expr), '\n')) exception=(err, bt)
