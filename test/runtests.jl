@@ -5846,6 +5846,47 @@ end
         pop!(LOAD_PATH)
     end
 
+    do_test("Distributed") && Base.VERSION >= v"1.12.0-DEV.2047" && @testset "Distributed repeated struct revision" begin
+        # A method whose text never changes must follow its argument struct through
+        # several revisions of that struct, on the master and on the workers.
+        newproc = only(addprocs(1))
+        Revise.init_worker(newproc)
+        dirname = randtmp()
+        mkdir(dirname)
+        @everywhere extend_LOAD_PATH(dirname) = copy!(LOAD_PATH, [LOAD_PATH; dirname])
+        for p in (myid(), newproc)
+            remotecall_wait(extend_LOAD_PATH, p, dirname)
+        end
+        copy!(to_remove, [to_remove; dirname])
+        modname = "ReviseDistributedRepeat"
+        dn = joinpath(dirname, modname, "src")
+        mkpath(dn)
+        source(nfields) = """
+            module ReviseDistributedRepeat
+            struct Record{T}
+            $(join(("    f$i::T" for i in 1:nfields), "\n"))
+            end
+            describe(record::Record) = length(fieldnames(typeof(record)))
+            make(x) = Record($(join(("x" for _ in 1:nfields), ", ")))
+            end
+            """
+        write(joinpath(dn, modname*".jl"), source(1))
+        sleep(mtimedelay)
+        using ReviseDistributedRepeat
+        sleep(mtimedelay)
+        @everywhere using ReviseDistributedRepeat
+        @test remotecall_fetch(ReviseDistributedRepeat.make, newproc, 1.0f0) isa ReviseDistributedRepeat.Record
+        for nfields in 2:4
+            write(joinpath(dn, modname*".jl"), source(nfields))
+            @yry()
+            @test ReviseDistributedRepeat.describe(ReviseDistributedRepeat.make(1.0f0)) == nfields
+            @test remotecall_fetch(ReviseDistributedRepeat.describe ∘ ReviseDistributedRepeat.make, newproc, 1.0f0) == nfields
+        end
+        rmprocs(newproc; waitfor=10)
+        rm_precompile("ReviseDistributedRepeat")
+        copy!(LOAD_PATH, LOAD_PATH[1:end-1])
+    end
+
     do_test("Distributed on worker") && @testset "Distributed on worker" begin
         # https://github.com/timholy/Revise.jl/pull/527
         favorite_proc, boring_proc = addprocs(2)
