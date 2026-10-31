@@ -1076,10 +1076,8 @@ function handle_method_deletion!(siginfo::SigInfo, rex::RelocatableExpr,
         # Delete the corresponding methods
         let delexpr = :(delete_method_by_sig($mt, $sig))
             record_worker_replay!(Main, delexpr)
-            for get_workers in workers_functions
-                for p in @invokelatest get_workers()
-                    apply_worker_action(p, Main, delexpr)  # guard against serialization errors if the type isn't defined on the worker
-                end
+            for p in master_workers()
+                apply_worker_action(p, Main, delexpr)
             end
         end
         Base.delete_method(m)
