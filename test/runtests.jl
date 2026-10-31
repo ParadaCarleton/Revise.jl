@@ -3331,6 +3331,30 @@ end
 
         rm_precompile("Orphan239")
 
+        # A field-less callable struct has a singleton `instance` that is not a function;
+        # adding a method for one must not make the orphan scan call `nameof` on it.
+        dn = joinpath(testdir, "Orphan239Callable", "src"); mkpath(dn)
+        fn = joinpath(dn, "Orphan239Callable.jl")
+        write(fn, """
+            module Orphan239Callable
+            struct Slot end
+            (::Slot)(x) = x
+            end
+            """)
+        sleep(mtimedelay)
+        @eval using Orphan239Callable
+        sleep(mtimedelay)
+        write(fn, """
+            module Orphan239Callable
+            struct Slot end
+            (::Slot)(x) = x
+            (::Slot)(x, y) = x + y
+            end
+            """)
+        @yry()
+        @test Orphan239Callable.Slot()(1, 2) == 3
+        rm_precompile("Orphan239Callable")
+
         # The bug is not specific to `Base`: it arises for any name brought into implicit scope
         # by a bare `using`. Here `flatten` (not a `Base` export) is shadowed via
         # `using Base.Iterators`, and the repair must re-import it from `Base.Iterators`.

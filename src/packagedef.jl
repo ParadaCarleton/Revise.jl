@@ -73,12 +73,17 @@ function record_worker_replay!(mod::Module, expr)
     return nothing
 end
 
-# Evaluate `expr` in `mod` on worker `p`, ignoring failures (e.g. `mod` not yet
-# loaded there, or a type the expression references being absent).
+"""
+Evaluate `expr` in `mod` on worker `p`. A failure (e.g. `mod` not yet loaded there) leaves
+the worker out of sync with the master, so warn, and rethrow when `rethrow_errors[]`.
+"""
 function apply_worker_action(p, mod::Module, expr)
     try
         @invokelatest remotecall_impl(Core.eval, p, mod, expr)
-    catch
+    catch err
+        bt = catch_backtrace()
+        @warn "Revise could not apply an edit on worker $p; it may keep stale code" mod expr=first(split(string(expr), '\n')) exception=(err, bt)
+        handle_caught(err, bt, "WorkerActionFailed"; deltainfo=(p, mod, expr))
     end
     return nothing
 end
@@ -1922,7 +1927,7 @@ function sig_function(@nospecialize(sig))
     ft = Base.unwrap_unionall(sig)
     ft isa DataType && !isempty(ft.parameters) || return nothing
     F = Base.unwrap_unionall(ft.parameters[1])
-    (F isa DataType && isdefined(F, :instance)) || return nothing
+    (F isa DataType && isdefined(F, :instance) && F <: Function) || return nothing
     return F.instance
 end
 
