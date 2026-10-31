@@ -73,12 +73,17 @@ function record_worker_replay!(mod::Module, expr)
     return nothing
 end
 
-# Evaluate `expr` in `mod` on worker `p`, ignoring failures (e.g. `mod` not yet
-# loaded there, or a type the expression references being absent).
+"""
+Evaluate `expr` in `mod` on worker `p`. A failure (e.g. `mod` not yet loaded there) leaves
+the worker out of sync with the master, so warn, and rethrow when `rethrow_errors[]`.
+"""
 function apply_worker_action(p, mod::Module, expr)
     try
-        @invokelatest remotecall_impl(Core.eval, p, mod, expr)
-    catch
+        @invokelatest fetch(@invokelatest remotecall_impl(Core.eval, p, mod, expr))  # fetch rethrows the worker's error
+    catch err
+        bt = catch_backtrace()
+        @warn "Revise could not apply an edit on worker $p; it may keep stale code" mod expr=first(split(string(expr), '\n')) exception=(err, bt)
+        handle_caught(err, bt, "WorkerActionFailed"; deltainfo=(p, mod, expr))
     end
     return nothing
 end
@@ -1071,10 +1076,8 @@ function handle_method_deletion!(siginfo::SigInfo, rex::RelocatableExpr,
         # Delete the corresponding methods
         let delexpr = :(delete_method_by_sig($mt, $sig))
             record_worker_replay!(Main, delexpr)
-            for get_workers in workers_functions
-                for p in @invokelatest get_workers()
-                    apply_worker_action(p, Main, delexpr)  # guard against serialization errors if the type isn't defined on the worker
-                end
+            for p in master_workers()
+                apply_worker_action(p, Main, delexpr)
             end
         end
         Base.delete_method(m)
@@ -1876,8 +1879,11 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
     # evaluating it once per method would leave shadowed duplicate definitions behind.
     # Those duplicates keep the pre-revision types in their signatures and become
     # dispatchable again as soon as a later revision deletes the copy shadowing them.
+    deleted_methods = IdSet{Method}()
     for (; reeval) in reeval_infos
         reeval isa Method || continue
+        reeval in deleted_methods && continue   # one method can match several signatures of an expression
+        push!(deleted_methods, reeval)
         with_logger(_debug_logger) do
             @debug "ReevalDeleteMethod" _group="Action" time=time() deltainfo=(reeval.sig, MethodSummary(reeval))
             # ensure that "old data" doesn't get run with "old methods"
@@ -1922,7 +1928,7 @@ function sig_function(@nospecialize(sig))
     ft = Base.unwrap_unionall(sig)
     ft isa DataType && !isempty(ft.parameters) || return nothing
     F = Base.unwrap_unionall(ft.parameters[1])
-    (F isa DataType && isdefined(F, :instance)) || return nothing
+    (F isa DataType && isdefined(F, :instance) && F <: Function) || return nothing
     return F.instance
 end
 
@@ -3253,7 +3259,6 @@ is what keeps closures serialized across workers (such as `@distributed` bodies)
 in sync after a revision, including for workers added later (issue #637).
 """
 function init_worker(p::AbstractWorker)
-    @invokelatest remotecall_impl(Core.eval, p, Main, :(import Serialization))  # `import` is only allowed at top level
     @invokelatest remotecall_impl(Core.eval, p, Main, quote
         function whichtt(mt::Union{Nothing, Core.MethodTable}, @nospecialize sig)
             ret = Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter())
@@ -3268,8 +3273,10 @@ function init_worker(p::AbstractWorker)
             isa(m, Method) && Base.delete_method(m)
         end
         function delete_method_by_sig(mt::Union{Nothing, Core.MethodTable}, sigbytes::AbstractVector{UInt8}, world::Integer)
-            sig = Base.invoke_in_world(UInt(world), Serialization.deserialize, IOBuffer(sigbytes))
-            delete_method_by_sig(mt, sig)
+            sig = Base.invoke_in_world(UInt(world), Base.loaded_modules[Base.PkgId(Base.UUID("9e88b42a-f829-5b0c-bbe9-9e923198166b"), "Serialization")].deserialize, IOBuffer(sigbytes))
+            m = whichtt(mt, sig)
+            m === nothing && error("no method with signature ", sig, " to delete on worker ", Distributed.myid(), "; methods matching: ", Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter()))
+            Base.delete_method(m)
         end
     end)
     @invokelatest(is_master_worker(p)) && return nothing
