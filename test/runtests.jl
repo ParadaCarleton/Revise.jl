@@ -5847,7 +5847,6 @@ end
         @test !hasfield(typeof(remotecall_fetch(ReviseDistributedBound.make, newproc, 1.0f0).progress), :b)
         old_finalise = ReviseDistributedBound.Finalise
         Distributed.remotecall_eval(Main, newproc, :(global old_finalise = ReviseDistributedBound.Finalise))
-        @info "DIAG before" master=string.(methods(old_finalise)) worker=Distributed.remotecall_eval(Main, newproc, :(string.(methods(old_finalise))))
         write(joinpath(dn, modname*".jl"), """
             module ReviseDistributedBound
             struct Progress{T}
@@ -5864,7 +5863,6 @@ end
         @yry()
         @test ReviseDistributedBound.make(1.0f0).progress.b == 1.0f0
         @test remotecall_fetch(ReviseDistributedBound.make, newproc, 1.0f0).progress.b == 1.0f0
-        @info "DIAG after" master=string.(methods(old_finalise)) worker=Distributed.remotecall_eval(Main, newproc, :(string.(methods(old_finalise))))
         @test isempty(methods(old_finalise))
         @test Distributed.remotecall_eval(Main, newproc, :(length(methods(old_finalise)))) == 0
         rmprocs(newproc; waitfor=10)
