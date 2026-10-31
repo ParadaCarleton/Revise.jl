@@ -1879,8 +1879,11 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
     # evaluating it once per method would leave shadowed duplicate definitions behind.
     # Those duplicates keep the pre-revision types in their signatures and become
     # dispatchable again as soon as a later revision deletes the copy shadowing them.
+    deleted_methods = IdSet{Method}()
     for (; reeval) in reeval_infos
         reeval isa Method || continue
+        reeval in deleted_methods && continue   # one method can match several signatures of an expression
+        push!(deleted_methods, reeval)
         with_logger(_debug_logger) do
             @debug "ReevalDeleteMethod" _group="Action" time=time() deltainfo=(reeval.sig, MethodSummary(reeval))
             # ensure that "old data" doesn't get run with "old methods"
@@ -3271,7 +3274,9 @@ function init_worker(p::AbstractWorker)
         end
         function delete_method_by_sig(mt::Union{Nothing, Core.MethodTable}, sigbytes::AbstractVector{UInt8}, world::Integer)
             sig = Base.invoke_in_world(UInt(world), Base.loaded_modules[Base.PkgId(Base.UUID("9e88b42a-f829-5b0c-bbe9-9e923198166b"), "Serialization")].deserialize, IOBuffer(sigbytes))
-            delete_method_by_sig(mt, sig)
+            m = whichtt(mt, sig)
+            m === nothing && error("no method with signature ", sig, " to delete on worker ", Distributed.myid(), "; methods matching: ", Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter()))
+            Base.delete_method(m)
         end
     end)
     @invokelatest(is_master_worker(p)) && return nothing
