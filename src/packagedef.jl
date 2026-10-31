@@ -3274,7 +3274,9 @@ function init_worker(p::AbstractWorker)
         end
         function delete_method_by_sig(mt::Union{Nothing, Core.MethodTable}, sigbytes::AbstractVector{UInt8}, world::Integer)
             sig = Base.invoke_in_world(UInt(world), Serialization.deserialize, IOBuffer(sigbytes))
-            delete_method_by_sig(mt, sig)
+            m = whichtt(mt, sig)
+            m === nothing && error("no method with signature ", sig, " to delete on worker ", Distributed.myid(), "; methods matching: ", Base._methods_by_ftype(sig, mt, -1, Base.get_world_counter()))
+            Base.delete_method(m)
         end
     end)
     @invokelatest(is_master_worker(p)) && return nothing
